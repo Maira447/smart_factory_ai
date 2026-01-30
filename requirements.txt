@@ -11,3 +11,7 @@ shap
 groq
 supabase
 plotly
+scipy
+numba
+llvmlite
+xgboost
