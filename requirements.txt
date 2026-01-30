@@ -9,3 +9,5 @@ Pillow
 python-dotenv
 shap
 groq
+supabase
+plotly

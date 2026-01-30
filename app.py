@@ -1,14 +1,19 @@
-# app.py
+ # app.py
 import os
 import streamlit as st
 import numpy as np
 import pandas as pd
 import joblib
+import base64
+from io import BytesIO
 from PIL import Image
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
+from groq import Groq
+from supabase import create_client
+
 
 # optional imports
 try:
@@ -17,6 +22,7 @@ try:
 except Exception:
     SHAP_AVAILABLE = False
 
+# Groq replacement for Gemini
 try:
     from groq import Groq
     GROQ_SDK_AVAILABLE = True
@@ -36,7 +42,7 @@ except Exception:
 st.set_page_config(page_title="Smart Factory Dashboard", layout="wide")
 
 # Core model filenames
-DEFECT_MODEL_FILE = "neu_defect_model.h5"
+DEFECT_MODEL_FILE = "textile_model (2).h5"
 PM_MODEL_FILE = "xgb_predictive_maintenance.joblib"
 SCALER_FILES = ["scaler.joblib", "pm_scaler.joblib"]
 LSTM_MODEL_FILE = "lstm_model.h5"
@@ -46,7 +52,17 @@ FORECAST_CSV = "monthly_retail_sales_cleaned.csv"  # now with month, Monthly_Sal
 # optional background data
 XSMOTE_FILE = "X_smote.csv"
 
-DEFECT_CLASSES = ['Cr', 'In', 'Pa', 'PS', 'RS', 'Sc']
+DEFECT_CLASSES = [
+    'Broken stitch', 
+    'Needle mark', 
+    'Pinched fabric', 
+    'Vertical', 
+    'defect free', 
+    'hole', 
+    'horizontal', 
+    'lines', 
+    'stain'
+]
 REQUIRED_FEATURES = [
     "Type",
     "Air temperature [K]",
@@ -59,19 +75,41 @@ REQUIRED_FEATURES = [
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Groq config (load from .env)
+# Groq config (Replacing Gemini)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_NAME = "llama3-70b-v2"
+GROQ_AVAILABLE = GROQ_API_KEY is not None
+
+if GROQ_AVAILABLE:
+    client = Groq(api_key=GROQ_API_KEY)
+# -----------------------
+# Supabase Config
+# -----------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+SUPABASE_AVAILABLE = SUPABASE_URL and SUPABASE_KEY
+
+if SUPABASE_AVAILABLE:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
+
+
 
 # -----------------------
 # Utility helpers
 # -----------------------
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, ttl=0)
 def load_defect_model(path=DEFECT_MODEL_FILE):
     if not os.path.exists(path):
-        st.error(f"Defect model file not found: {path}")
+        st.error(f"Model file nahi mili: {path}")
         st.stop()
-    return tf.keras.models.load_model(path)
+    try:
+        model = tf.keras.models.load_model(path, compile=False)
+        return model
+    except Exception as e:
+        st.error(f"Model load karne mein error: {e}")
+        st.stop()
 
 @st.cache_resource(show_spinner=False)
 def load_pm_model(path=PM_MODEL_FILE):
@@ -126,51 +164,153 @@ def log_to_csv(file_path, data_dict):
     else:
         df.to_csv(file_path, index=False)
 
+def fetch_latest_machine_data():
+    if supabase is None:
+        return None
+
+    response = (
+        supabase
+        .table("machine_telemetry")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not response.data:
+        return None
+
+    row = response.data[0]
+
+    return {
+        "Type": float(row["type"]),
+        "Air temperature [K]": float(row["air_temp"]),
+        "Process temperature [K]": float(row["process_temp"]),
+        "Rotational speed [rpm]": float(row["rpm"]),
+        "Torque [Nm]": float(row["torque"]),
+        "Tool wear [min]": float(row["tool_wear"])
+    }
+
+
+def encode_image(image_pil):
+    buffered = BytesIO()
+    image_pil.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+def analyze_defect_with_groq(image_pil, defect_class):
+    try:
+        base64_image = encode_image(image_pil)
+        prompt = f"""
+        You are a textile manufacturing quality control expert.
+        The vision model predicted this textile defect class: {defect_class}.
+        Analyze the uploaded fabric surface image and provide:
+        1. Typical visual markers for {defect_class}.
+        2. Severity level (Low / Medium / High)
+        3. Root cause (e.g., needle tension, loom synchronization, or yarn contamination).
+        4. Corrective and Preventive actions for the production line.
+        6. Preventive measures to avoid recurrence
+        """
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Groq analysis failed: {e}"
+
+
 # -----------------------
 # Page layout
 # -----------------------
-module = st.sidebar.radio("Choose module", [
-    "🏭 Manufacturer Dashboard",
-    "🩻 Steel Defect Detection",
-    "⚙️ Predictive Maintenance",
-    "📈 Production Forecasting (LSTM)"
-])
+from urllib.parse import quote
+
+MENU = [
+    ("manufacturer", "🏭 Home"),
+    ("defect", "🩻 Textile Defect Detection"),
+    ("pm", "⚙️ Predictive Maintenance"),
+    ("forecast", "📈 Production Forecasting (LSTM)")
+]
+
+_qparams = st.query_params
+_qmodule = _qparams.get("module", "manufacturer")
+
+if isinstance(_qmodule, list):
+    active_key = _qmodule[0] if len(_qmodule) > 0 else "manufacturer"
+elif _qmodule is None or _qmodule == "":
+    active_key = "manufacturer"
+else:
+    active_key = str(_qmodule)
+
+st.sidebar.markdown(
+    """
+    <style>
+    .sidebar-menu { font-family: "Inter", sans-serif; padding: 8px 8px 20px 8px; }
+    .menu-title { color: #f1f3f5; font-size: 13px; margin: 8px 12px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.06em; }
+    .menu-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; margin: 6px 6px; border-radius: 10px; text-decoration: none; color: #dde3e8; background: transparent; transition: background 0.12s ease, transform 0.06s ease; border: 1px solid transparent; }
+    .menu-item:hover { background: rgba(255,255,255,0.02); transform: translateY(-1px); color: #fff; }
+    .menu-item .icon { font-size: 18px; width: 26px; text-align: center; }
+    .menu-item .label { font-weight: 600; font-size: 15px; }
+    .menu-item.active { background: linear-gradient(90deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01)); border: 1px solid rgba(255,255,255,0.04); box-shadow: 0 6px 18px rgba(0,0,0,0.45) inset; color: #ffffff; }
+    .menu-footer { color: #9aa3ab; font-size: 12px; padding: 8px 12px 20px 12px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+menu_html = "<div class='sidebar-menu'><div class='menu-title'></div>"
+for key, label in MENU:
+    icon = label.split()[0]
+    text = " ".join(label.split()[1:])
+    active_cls = "active" if key == active_key else ""
+    href = f"?module={quote(key)}"
+    menu_html += (
+        f"<a class='menu-item {active_cls}' href='{href}'>"
+        f"<div class='icon'>{icon}</div>"
+        f"<div class='label'>{text}</div>"
+        f"</a>"
+    )
+menu_html += "<div class='menu-footer'>Quick links: dashboard • defect detector • maintenance • forecasting</div></div>"
+st.sidebar.markdown(menu_html, unsafe_allow_html=True)
+
+_map = {
+    "manufacturer": "🏭 Manufacturer Dashboard",
+    "defect": "🩻 Textile Defect Detection",
+    "pm": "⚙️ Predictive Maintenance",
+    "forecast": "📈 Production Forecasting (LSTM)"
+}
+module = _map.get(active_key, "🏭 Manufacturer Dashboard")
 
 # -----------------------
 # Manufacturer Dashboard
 # -----------------------
-# 🏭 Manufacturer Dashboard
 if module == "🏭 Manufacturer Dashboard":
-    # --- Page Header ---
     st.markdown("""
         <style>
-        .main {
-            background: linear-gradient(135deg, #f8f9fa 0%, #eef1f5 100%);
-        }
-        .stMetric {
-            background: rgba(255, 255, 255, 0.7);
-            border-radius: 12px;
-            padding: 10px !important;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.08);
-        }
-        h1 {
-            text-align: center;
-            font-weight: 800;
-            color: #333333;
-        }
-        .sub-title {
-            text-align: center;
-            color: #666;
-            font-size: 18px;
-            margin-bottom: 25px;
-        }
+        .main { background: linear-gradient(135deg, #f8f9fa 0%, #eef1f5 100%); }
+        .stMetric { background: rgba(255, 255, 255, 0.7); border-radius: 12px; padding: 10px !important; box-shadow: 0 4px 8px rgba(0,0,0,0.08); }
+        h1 { text-align: center; font-weight: 800; color: #333333; }
+        .sub-title { text-align: center; color: #666; font-size: 18px; margin-bottom: 25px; }
         </style>
     """, unsafe_allow_html=True)
 
-    st.markdown("<h1>📊 Smart Steel Factory </h1>", unsafe_allow_html=True)
+    st.markdown("<h1>📊 FactoryMindAI </h1>", unsafe_allow_html=True)
     st.markdown("<p class='sub-title'>Real-time overview of factory KPIs and performance efficiency</p>", unsafe_allow_html=True)
 
-    # --- Top Metrics Row ---
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("🏭 Factories", "6 / 7")
     col2.metric("🧩 Production Lines", "26 / 32")
@@ -180,9 +320,6 @@ if module == "🏭 Manufacturer Dashboard":
 
     st.divider()
     st.markdown("### ⚙️ Equipment & Quality Overview")
-
-    # --- Circular Gauges ---
-    import plotly.graph_objects as go
 
     def circle_gauge(value, label, color):
         fig = go.Figure(go.Indicator(
@@ -198,27 +335,13 @@ if module == "🏭 Manufacturer Dashboard":
                 'bordercolor': "#E0E0E0",
             }
         ))
-        fig.update_layout(
-            height=280,
-            margin=dict(t=30, b=0, l=0, r=0),
-            paper_bgcolor="rgba(0,0,0,0)",
-            font={'color': '#333', 'family': "Arial"}
-        )
+        fig.update_layout(height=280, margin=dict(t=30, b=0, l=0, r=0), paper_bgcolor="rgba(0,0,0,0)", font={'color': '#333'})
         return fig
 
-    # --- Show Circular Charts ---
     colA, colB, colC = st.columns(3)
     colA.plotly_chart(circle_gauge(67.8, "OEE (Effectiveness)", "#FFB347"), use_container_width=True)
     colB.plotly_chart(circle_gauge(87.2, "Production Rate", "#36CFC9"), use_container_width=True)
     colC.plotly_chart(circle_gauge(99, "Quality Rate", "#9CDB4B"), use_container_width=True)
-
-    # --- Footer Summary ---
-    st.markdown("""
-        <div style='text-align:center; color:#666; margin-top:25px; font-size:15px;'>
-            💡 This dashboard visualizes key factory KPIs. Live data integration coming soon!
-        </div>
-    """, unsafe_allow_html=True)
-
 
     st.markdown("---")
     st.subheader("Defect Type Distribution (from logs)")
@@ -228,8 +351,6 @@ if module == "🏭 Manufacturer Dashboard":
         chart_df = df_log["class"].value_counts().reset_index()
         chart_df.columns = ["Defect", "Count"]
         st.bar_chart(chart_df.set_index("Defect"))
-    else:
-        st.info("No defect data logged yet.")
 
     st.subheader("Predicted Failures (from logs)")
     maint_log = os.path.join(DATA_DIR, "maintenance_log.csv")
@@ -237,15 +358,14 @@ if module == "🏭 Manufacturer Dashboard":
         dfm = pd.read_csv(maint_log)
         st.write("Average Failure Probability: ", f"{dfm['failure_prob'].mean():.2f}%")
         st.line_chart(dfm["failure_prob"])
-    else:
-        st.info("No maintenance predictions logged yet.")
 
 # -----------------------
-# Steel defect detection
+# Textile defect detection
 # -----------------------
-elif module == "🩻 Steel Defect Detection":
-    st.title("🩻 Steel Surface Defect Detection")
-    uploaded_file = st.file_uploader("Upload steel image", type=["png","jpg","jpeg"])
+elif module == "🩻 Textile Defect Detection":
+    st.title("🩻 Textile Surface Defect Detection")
+    uploaded_file = st.file_uploader("Upload textile image", type=["png","jpg","jpeg"])
+    
     if uploaded_file:
         defect_model = load_defect_model()
         arr, pil_img = preprocess_image(uploaded_file)
@@ -253,9 +373,25 @@ elif module == "🩻 Steel Defect Detection":
         class_idx = int(np.argmax(preds, axis=1)[0])
         conf = float(np.max(preds))
         class_name = DEFECT_CLASSES[class_idx]
-        st.image(pil_img, caption=f"Predicted: {class_name} ({conf*100:.2f}%)", use_container_width=True)
-        probs_df = pd.DataFrame({"Class": DEFECT_CLASSES, "Probability": preds[0]})
-        st.bar_chart(probs_df.set_index("Class"))
+        
+        # UI Change: Two columns to show image and analysis side-by-side
+        col_img, col_analysis = st.columns([1, 1.2]) 
+
+        with col_img:
+            # Resize image to be smaller in the UI
+            st.image(pil_img, caption=f"Predicted: {class_name} ({conf*100:.2f}%)", use_container_width=True)
+            probs_df = pd.DataFrame({"Class": DEFECT_CLASSES, "Probability": preds[0]})
+            st.bar_chart(probs_df.set_index("Class"))
+
+        with col_analysis:
+            st.markdown("### 🧠 AI Textile Defect Expert Analysis")
+            if not GROQ_AVAILABLE:
+                st.warning("Groq API key not configured.")
+            else:
+                with st.spinner("Analyzing textile defect using Groq Llama Vision..."):
+                    groq_report = analyze_defect_with_groq(pil_img, class_name)
+                    st.success("Analysis Complete")
+                    st.markdown(groq_report)
 
         log_to_csv(os.path.join(DATA_DIR, "defect_log.csv"), {
             "timestamp": pd.Timestamp.now(),
@@ -263,9 +399,6 @@ elif module == "🩻 Steel Defect Detection":
             "confidence": conf
         })
 
-# -----------------------
-# Predictive Maintenance
-# -----------------------
 elif module == "⚙️ Predictive Maintenance":
     st.title("⚙️ Predictive Maintenance Checker")
 
@@ -377,6 +510,51 @@ elif module == "⚙️ Predictive Maintenance":
                 "Status": "FAILURE" if pred_sim == 1 else "NORMAL"
             })
         st.dataframe(pd.DataFrame(sim_results))
+    
+    st.markdown("---")
+    st.subheader("📡 Live Machine Data (Supabase Auto Fetch)")
+    
+    machine_data = None
+    if not SUPABASE_AVAILABLE:
+        st.warning("Supabase not configured. Add SUPABASE_URL and SUPABASE_KEY to .env")
+    else:
+        if st.button("Fetch Latest Supabase Data & Predict"):
+            machine_data = fetch_latest_machine_data()
+
+        if machine_data is None:
+            st.warning("No machine data found in Supabase.")
+        else:
+            st.write("📥 Latest Telemetry", machine_data)
+
+            X = format_feature_input(machine_data)
+            Xs = pm_scaler.transform(X)
+
+            pred = pm_model.predict(Xs)[0]
+            probs = pm_model.predict_proba(Xs)[0]
+
+            if model_classes is not None:
+                try:
+                    idx1 = int(np.where(model_classes == 1)[0][0])
+                    failure_prob = probs[idx1]
+                except Exception:
+                    failure_prob = 1.0 - probs[0]
+            else:
+                failure_prob = probs[1] if len(probs) > 1 else (1.0 - probs[0])
+
+            failure_pct = float(failure_prob * 100)
+
+            if pred == 1:
+                st.error(f"❌ FAILURE Likely ({failure_pct:.2f}%)")
+            else:
+                st.success(f"✅ NORMAL Operation ({failure_pct:.2f}%)")
+
+            log_to_csv(os.path.join(DATA_DIR, "maintenance_log.csv"), {
+                "timestamp": pd.Timestamp.now(),
+                **machine_data,
+                "failure_pred": int(pred),
+                "failure_prob": failure_pct
+            })
+
 
     # SHAP bar plot
     st.markdown("---")
@@ -453,7 +631,7 @@ elif module == "⚙️ Predictive Maintenance":
             )
             try:
                 response = groq_client.chat.completions.create(
-                    model=GROQ_MODEL_NAME,
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=400
                 )
@@ -469,44 +647,26 @@ elif module == "⚙️ Predictive Maintenance":
 elif module == "📈 Production Forecasting (LSTM)":
     st.title("📈 Future Production Forecast – LSTM Model")
 
-    # File checks
-    if not os.path.exists(LSTM_MODEL_FILE):
-        st.error(f"LSTM model file not found: {LSTM_MODEL_FILE}")
-        st.stop()
-    if not os.path.exists(FORECAST_SCALER_FILE):
-        st.error(f"Forecast scaler not found: {FORECAST_SCALER_FILE}")
-        st.stop()
-    if not os.path.exists(FORECAST_CSV):
-        st.error(f"Forecast CSV not found: {FORECAST_CSV}")
+    if not os.path.exists(LSTM_MODEL_FILE) or not os.path.exists(FORECAST_SCALER_FILE):
+        st.error("Missing model or scaler files.")
         st.stop()
 
-    # Load LSTM + Scaler
     lstm_model = load_lstm_model(LSTM_MODEL_FILE)
     forecast_scaler = load_forecast_scaler(FORECAST_SCALER_FILE)
 
-    # ✅ FIXED: Correct CSV column handling
     df_hist = pd.read_csv(FORECAST_CSV)
     df_hist = df_hist.rename(columns={"month": "Date", "Monthly_Sales": "Production"})
     df_hist["Date"] = pd.to_datetime(df_hist["Date"], errors="coerce")
-
-    if "Production" not in df_hist.columns:
-        st.error("CSV must contain a 'Production' column.")
-        st.stop()
-
     df_hist = df_hist.sort_values("Date").reset_index(drop=True)
     series = df_hist.set_index("Date")["Production"].astype(float)
 
     st.subheader("📊 Historical Production Data")
     st.line_chart(series)
 
-    # Forecast parameters
-    st.subheader("Forecast settings")
-    seq_len = st.number_input("Sequence length used during training (timesteps)", min_value=1, max_value=60, value=12)
-    months = st.slider("Months ahead to forecast", 1, 24, 12)
+    seq_len = st.number_input("Sequence length", min_value=1, max_value=60, value=12)
+    months = st.slider("Months ahead", 1, 24, 12)
 
-    if len(series) < seq_len:
-        st.error(f"Not enough history for seq_len={seq_len}. Need at least {seq_len} months.")
-    else:
+    if len(series) >= seq_len:
         last_vals = series.values[-seq_len:].reshape(-1, 1)
         scaled_seq = forecast_scaler.transform(last_vals).reshape(1, seq_len, 1)
 
@@ -518,7 +678,6 @@ elif module == "📈 Production Forecasting (LSTM)":
             seq = np.append(seq[:, 1:, :], [[[pred_scaled]]], axis=1)
 
         preds_rescaled = forecast_scaler.inverse_transform(np.array(preds_scaled).reshape(-1, 1)).flatten()
-
         last_date = series.index[-1]
         future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=months, freq="MS")
         forecast_df = pd.DataFrame({"Forecasted Production": preds_rescaled}, index=future_dates)
@@ -526,15 +685,13 @@ elif module == "📈 Production Forecasting (LSTM)":
         st.subheader("📉 Forecasted Production")
         combined = pd.concat([series, forecast_df["Forecasted Production"]], axis=1)
         combined.columns = ["Historical", "Forecast"]
-        st.line_chart(combined.fillna(method="ffill"))
-
-        st.write("Forecast table (next months):")
+        st.line_chart(combined.ffill())
         st.dataframe(forecast_df)
-
-        if st.button("Save forecast to CSV"):
-            out_file = "future_12_months_forecast_table.csv"
-            forecast_df.to_csv(out_file)
-            st.success(f"Saved forecast to {out_file}")
 
 st.markdown("---")
 st.caption("Smart Factory Dashboard • CNN Defect Detection + Predictive Maintenance + LSTM Forecasting • Streamlit")
+
+    
+    
+
+    
