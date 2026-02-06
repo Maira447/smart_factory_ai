@@ -1,0 +1,17 @@
+streamlit
+tensorflow
+scikit-learn
+joblib
+pandas
+numpy
+matplotlib
+Pillow
+python-dotenv
+shap
+groq
+supabase
+plotly
+scipy
+numba
+llvmlite
+xgboost
