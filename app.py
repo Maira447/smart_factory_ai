@@ -568,7 +568,7 @@ elif active_key == "pm":
             "Type": m_type,
             "Air temperature [K]": air,
             "Process temperature [K]": proc,
-            "Vibration": rpm,
+            "Rotational speed [rpm]": rpm,
             "Torque [Nm]": torque,
             "Tool wear [min]": wear,
         }
